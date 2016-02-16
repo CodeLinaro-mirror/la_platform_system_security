@@ -40,7 +40,7 @@
 #include <openssl/md5.h>
 #include <openssl/pem.h>
 
-#include <hardware/keymaster.h>
+#include <hardware/keymaster0.h>
 
 #include <keymaster/softkeymaster.h>
 
@@ -102,7 +102,7 @@ struct PKCS8_PRIV_KEY_INFO_Delete {
 typedef UniquePtr<PKCS8_PRIV_KEY_INFO, PKCS8_PRIV_KEY_INFO_Delete> Unique_PKCS8_PRIV_KEY_INFO;
 
 
-static int keymaster_device_initialize(keymaster_device_t** dev) {
+static int keymaster_device_initialize(keymaster0_device_t** dev) {
     int rc;
 
     const hw_module_t* mod;
@@ -112,7 +112,7 @@ static int keymaster_device_initialize(keymaster_device_t** dev) {
         goto out;
     }
 
-    rc = keymaster_open(mod, dev);
+    rc = keymaster0_open(mod, dev);
     if (rc) {
         ALOGE("could not open keymaster device in %s (%s)",
             KEYSTORE_HARDWARE_MODULE_ID, strerror(-rc));
@@ -126,8 +126,8 @@ out:
     return rc;
 }
 
-static void keymaster_device_release(keymaster_device_t* dev) {
-    keymaster_close(dev);
+static void keymaster_device_release(keymaster0_device_t* dev) {
+    keymaster0_close(dev);
 }
 
 /***************
@@ -944,7 +944,7 @@ typedef struct {
 
 class KeyStore {
 public:
-    KeyStore(Entropy* entropy, keymaster_device_t* device)
+    KeyStore(Entropy* entropy, keymaster0_device_t* device)
         : mEntropy(entropy)
         , mDevice(device)
     {
@@ -965,7 +965,7 @@ public:
         mMasterKeys.clear();
     }
 
-    keymaster_device_t* getDevice() const {
+    keymaster0_device_t* getDevice() const {
         return mDevice;
     }
 
@@ -1363,7 +1363,7 @@ private:
     static const android::String16 sRSAKeyType;
     Entropy* mEntropy;
 
-    keymaster_device_t* mDevice;
+    keymaster0_device_t* mDevice;
 
     android::Vector<UserState*> mMasterKeys;
 
@@ -1842,7 +1842,7 @@ public:
         int rc;
         bool isFallback = false;
 
-        const keymaster_device_t* device = mKeyStore->getDevice();
+        const keymaster0_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
             return ::SYSTEM_ERROR;
         }
@@ -2016,7 +2016,7 @@ public:
             return responseCode;
         }
 
-        const keymaster_device_t* device = mKeyStore->getDevice();
+        const keymaster0_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
             ALOGE("no keymaster device; cannot sign");
             return ::SYSTEM_ERROR;
@@ -2071,7 +2071,7 @@ public:
             return responseCode;
         }
 
-        const keymaster_device_t* device = mKeyStore->getDevice();
+        const keymaster0_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
             return ::SYSTEM_ERROR;
         }
@@ -2128,7 +2128,7 @@ public:
             return responseCode;
         }
 
-        const keymaster_device_t* device = mKeyStore->getDevice();
+        const keymaster0_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
             return ::SYSTEM_ERROR;
         }
@@ -2334,7 +2334,7 @@ public:
             return ::PERMISSION_DENIED;
         }
 
-        const keymaster_device_t* device = mKeyStore->getDevice();
+        const keymaster0_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
             ALOGW("can't get keymaster device");
             return ::SYSTEM_ERROR;
@@ -2432,7 +2432,7 @@ private:
         return false;
     }
 
-    bool isKeyTypeSupported(const keymaster_device_t* device, keymaster_keypair_t keyType) {
+    bool isKeyTypeSupported(const keymaster0_device_t* device, keymaster_keypair_t keyType) {
         const int32_t device_api = device->common.module->module_api_version;
         if (device_api == KEYMASTER_MODULE_API_VERSION_0_2) {
             switch (keyType) {
@@ -2479,7 +2479,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    keymaster_device_t* dev;
+    keymaster0_device_t* dev;
     if (keymaster_device_initialize(&dev)) {
         ALOGE("keystore keymaster could not be initialized; exiting");
         return 1;
