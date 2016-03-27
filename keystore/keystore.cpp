@@ -61,8 +61,6 @@
 
 #include <keystore/keystore.h>
 
-#include <selinux/android.h>
-
 #include <sstream>
 
 #include "auth_token_table.h"
@@ -331,9 +329,6 @@ static struct user_perm {
 static const perm_t DEFAULT_PERMS = static_cast<perm_t>(P_GET_STATE | P_GET | P_INSERT | P_DELETE
                                                         | P_EXIST | P_LIST | P_SIGN | P_VERIFY);
 
-static char *tctx;
-static int ks_is_selinux_enabled;
-
 static const char *get_perm_label(perm_t perm) {
     unsigned int index = ffs(perm);
     if (index > 0 && index <= (sizeof(perm_labels) / sizeof(perm_labels[0]))) {
@@ -360,31 +355,8 @@ static uid_t get_user_id(uid_t uid) {
     return uid / AID_USER;
 }
 
-static bool keystore_selinux_check_access(uid_t /*uid*/, perm_t perm, pid_t spid) {
-    if (!ks_is_selinux_enabled) {
-        return true;
-    }
-
-    char *sctx = NULL;
-    const char *selinux_class = "keystore_key";
-    const char *str_perm = get_perm_label(perm);
-
-    if (!str_perm) {
-        return false;
-    }
-
-    if (getpidcon(spid, &sctx) != 0) {
-        ALOGE("SELinux: Failed to get source pid context.\n");
-        return false;
-    }
-
-    bool allowed = selinux_check_access(sctx, tctx, selinux_class, str_perm,
-            NULL) == 0;
-    freecon(sctx);
-    return allowed;
-}
-
 static bool has_permission(uid_t uid, perm_t perm, pid_t spid) {
+    (void) spid;
     // All system users are equivalent for multi-user support.
     if (get_app_id(uid) == AID_SYSTEM) {
         uid = AID_SYSTEM;
@@ -393,13 +365,11 @@ static bool has_permission(uid_t uid, perm_t perm, pid_t spid) {
     for (size_t i = 0; i < sizeof(user_perms)/sizeof(user_perms[0]); i++) {
         struct user_perm user = user_perms[i];
         if (user.uid == uid) {
-            return (user.perms & perm) &&
-                keystore_selinux_check_access(uid, perm, spid);
+            return (user.perms & perm);
         }
     }
 
-    return (DEFAULT_PERMS & perm) &&
-        keystore_selinux_check_access(uid, perm, spid);
+    return (DEFAULT_PERMS & perm);
 }
 
 /**
@@ -3357,19 +3327,6 @@ int main(int argc, char* argv[]) {
     if (fallback_keymaster_device_initialize(&fallback)) {
         ALOGE("software keymaster could not be initialized; exiting");
         return 1;
-    }
-
-    ks_is_selinux_enabled = is_selinux_enabled();
-    if (ks_is_selinux_enabled) {
-        union selinux_callback cb;
-        cb.func_log = selinux_log_callback;
-        selinux_set_callback(SELINUX_CB_LOG, cb);
-        if (getcon(&tctx) != 0) {
-            ALOGE("SELinux: Could not acquire target context. Aborting keystore.\n");
-            return -1;
-        }
-    } else {
-        ALOGI("SELinux: Keystore SELinux is disabled.\n");
     }
 
     KeyStore keyStore(&entropy, dev, fallback);
