@@ -40,8 +40,10 @@ const android::String16 KeyStore::sRSAKeyType("RSA");
 
 using namespace keystore;
 
-KeyStore::KeyStore(Entropy* entropy, const km_device_t& device, const km_device_t& fallback)
-    : mEntropy(entropy), mDevice(device), mFallbackDevice(fallback) {
+KeyStore::KeyStore(Entropy* entropy, const km_device_t& device, const km_device_t& fallback,
+                   bool allowNewFallback)
+    : mEntropy(entropy), mDevice(device), mFallbackDevice(fallback),
+      mAllowNewFallback(allowNewFallback) {
     memset(&mMetaData, '\0', sizeof(mMetaData));
 }
 
@@ -309,8 +311,10 @@ ResponseCode KeyStore::del(const char* filename, const BlobType type, uid_t user
         return rc;
     }
 
+    auto& dev = getDevice(keyBlob);
+
     if (keyBlob.getType() == ::TYPE_KEY_PAIR || keyBlob.getType() == ::TYPE_KEYMASTER_10) {
-        auto ret = KS_HANDLE_HIDL_ERROR(mDevice->deleteKey(blob2hidlVec(keyBlob)));
+        auto ret = KS_HANDLE_HIDL_ERROR(dev->deleteKey(blob2hidlVec(keyBlob)));
 
         // A device doesn't have to implement delete_key.
         if (ret != ErrorCode::OK && ret != ErrorCode::UNIMPLEMENTED)
