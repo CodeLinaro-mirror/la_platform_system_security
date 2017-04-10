@@ -21,13 +21,15 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
 
 #define LOG_TAG "keystore-engine"
-
 #include <UniquePtr.h>
 
+#include <pthread.h>
 #include <sys/socket.h>
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <cutils/log.h>
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -38,16 +40,13 @@
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 
-#include <binder/IServiceManager.h>
-#include <keystore/keystore.h>
-#include <keystore/IKeystoreService.h>
-#include <keystore/keystore_hidl_support.h>
-
-using namespace android;
+#ifndef BACKEND_WIFI_HIDL
+#include "keystore_backend_binder.h"
+#else
+#include "keystore_backend_hidl.h"
+#endif
 
 namespace {
-using namespace keystore;
-
 extern const RSA_METHOD keystore_rsa_method;
 extern const ECDSA_METHOD keystore_ecdsa_method;
 
@@ -111,11 +110,17 @@ class KeystoreEngine {
 
 pthread_once_t g_keystore_engine_once = PTHREAD_ONCE_INIT;
 KeystoreEngine *g_keystore_engine;
+KeystoreBackend *g_keystore_backend;
 
 /* init_keystore_engine is called to initialize |g_keystore_engine|. This
  * should only be called by |pthread_once|. */
 void init_keystore_engine() {
     g_keystore_engine = new KeystoreEngine;
+#ifndef BACKEND_WIFI_HIDL
+    g_keystore_backend = new KeystoreBackendBinder;
+#else
+    g_keystore_backend = new KeystoreBackendHidl;
+#endif
 }
 
 /* ensure_keystore_engine ensures that |g_keystore_engine| is pointing to a
@@ -143,45 +148,43 @@ const char* rsa_get_key_id(const RSA* rsa) {
 int rsa_private_transform(RSA *rsa, uint8_t *out, const uint8_t *in, size_t len) {
     ALOGV("rsa_private_transform(%p, %p, %p, %u)", rsa, out, in, (unsigned) len);
 
+    ensure_keystore_engine();
+
     const char *key_id = rsa_get_key_id(rsa);
     if (key_id == NULL) {
         ALOGE("key had no key_id!");
         return 0;
     }
 
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
-
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
+    uint8_t* reply = NULL;
+    size_t reply_len;
+    int32_t ret = g_keystore_backend->sign(key_id, in, len, &reply, &reply_len);
+    if (ret < 0) {
+        ALOGW("There was an error during rsa_decrypt: could not connect");
         return 0;
-    }
-    auto inBlob = blob2hidlVec(in ,len);
-    hidl_vec<uint8_t> reply;
-
-    auto ret = service->sign(String16(key_id), inBlob, &reply);
-    if (!ret.isOk()) {
-        ALOGW("Error during sign from keystore: %d", int32_t(ret));
+    } else if (ret != 0) {
+        ALOGW("Error during sign from keystore: %d", ret);
         return 0;
-    } else if (reply.size() == 0) {
+    } else if (reply_len == 0 || reply == NULL) {
         ALOGW("No valid signature returned");
         return 0;
     }
 
-    if (reply.size() > len) {
+    if (reply_len > len) {
         /* The result of the RSA operation can never be larger than the size of
          * the modulus so we assume that the result has extra zeros on the
          * left. This provides attackers with an oracle, but there's nothing
          * that we can do about it here. */
-        memcpy(out, &reply[reply.size() - len], len);
-    } else if (reply.size() < len) {
+        ALOGW("Reply len %zu greater than expected %zu", reply_len, len);
+        memcpy(out, &reply[reply_len - len], len);
+    } else if (reply_len < len) {
         /* If the Keystore implementation returns a short value we assume that
          * it's because it removed leading zeros from the left side. This is
          * bad because it provides attackers with an oracle but we cannot do
          * anything about a broken Keystore implementation here. */
+        ALOGW("Reply len %zu lesser than expected %zu", reply_len, len);
         memset(out, 0, len);
-        memcpy(out + len - reply.size(), &reply[0], reply.size());
+        memcpy(out + len - reply_len, &reply[0], reply_len);
     } else {
         memcpy(out, &reply[0], len);
     }
@@ -234,41 +237,34 @@ static int ecdsa_sign(const uint8_t* digest, size_t digest_len, uint8_t* sig,
                       unsigned int* sig_len, EC_KEY* ec_key) {
     ALOGV("ecdsa_sign(%p, %u, %p)", digest, (unsigned) digest_len, ec_key);
 
+    ensure_keystore_engine();
+
     const char *key_id = ecdsa_get_key_id(ec_key);
     if (key_id == NULL) {
         ALOGE("key had no key_id!");
         return 0;
     }
 
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
-
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
-        return 0;
-    }
-
     size_t ecdsa_size = ECDSA_size(ec_key);
 
-    auto hidlDigest = blob2hidlVec(digest, digest_len);
-    hidl_vec<uint8_t> reply;
-    auto ret = service->sign(String16(reinterpret_cast<const char*>(key_id)),
-                                hidlDigest, &reply);
-    if (!ret.isOk()) {
-        ALOGW("Error during sign from keystore: %d", int32_t(ret));
+    uint8_t* reply = NULL;
+    size_t reply_len;
+    int32_t ret = g_keystore_backend->sign(
+            key_id, digest, digest_len, &reply, &reply_len);
+    if (ret < 0) {
+        ALOGW("There was an error during ecdsa_sign: could not connect");
         return 0;
-    } else if (reply.size() == 0) {
+    } else if (reply_len == 0 || reply == NULL) {
         ALOGW("No valid signature returned");
         return 0;
-    } else if (reply.size() > ecdsa_size) {
+    } else if (reply_len > ecdsa_size) {
         ALOGW("Signature is too large");
         return 0;
     }
 
     // Reviewer: should't sig_len be checked here? Or is it just assumed that it is at least ecdsa_size?
-    memcpy(sig, &reply[0], reply.size());
-    *sig_len = reply.size();
+    memcpy(sig, &reply[0], reply_len);
+    *sig_len = reply_len;
 
     ALOGV("ecdsa_sign(%p, %u, %p) => success", digest, (unsigned)digest_len,
           ec_key);
@@ -395,30 +391,25 @@ EVP_PKEY* EVP_PKEY_from_keystore(const char* key_id) __attribute__((visibility("
 EVP_PKEY* EVP_PKEY_from_keystore(const char* key_id) {
     ALOGV("EVP_PKEY_from_keystore(\"%s\")", key_id);
 
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("android.security.keystore"));
-    sp<IKeystoreService> service = interface_cast<IKeystoreService>(binder);
+    ensure_keystore_engine();
 
-    if (service == NULL) {
-        ALOGE("could not contact keystore");
-        return 0;
-    }
-
-    hidl_vec<uint8_t> pubkey;
-    auto ret = service->get_pubkey(String16(key_id), &pubkey);
-    if (!ret.isOk()) {
-        ALOGW("keystore reports error: %d", int32_t(ret));
+    uint8_t *pubkey = NULL;
+    size_t pubkey_len;
+    int32_t ret = g_keystore_backend->get_pubkey(key_id, &pubkey, &pubkey_len);
+    if (ret < 0) {
+        ALOGW("could not contact keystore");
+        return NULL;
+    } else if (ret != 0 || pubkey == NULL) {
+        ALOGW("keystore reports error: %d", ret);
         return NULL;
     }
 
-    const uint8_t *inp = &pubkey[0];
-    Unique_EVP_PKEY pkey(d2i_PUBKEY(NULL, &inp, pubkey.size()));
+    const uint8_t *inp = pubkey;
+    Unique_EVP_PKEY pkey(d2i_PUBKEY(NULL, &inp, pubkey_len));
     if (pkey.get() == NULL) {
         ALOGW("Cannot convert pubkey");
         return NULL;
     }
-
-    ensure_keystore_engine();
 
     EVP_PKEY *result;
     switch (EVP_PKEY_type(pkey->type)) {
