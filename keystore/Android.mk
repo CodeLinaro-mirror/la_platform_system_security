@@ -31,6 +31,7 @@ LOCAL_SHARED_LIBRARIES := \
 	liblog \
 	libsoftkeymaster \
 	libutils \
+	libselinux \
 	libsoftkeymasterdevice \
 	libkeymaster_messages \
 	libkeymaster1
