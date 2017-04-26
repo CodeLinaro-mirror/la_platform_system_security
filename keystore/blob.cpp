@@ -83,8 +83,11 @@ void Blob::setEncrypted(bool encrypted) {
     mBlob.flags = setFlag(mBlob.flags, encrypted, KEYSTORE_FLAG_ENCRYPTED);
 }
 
-void Blob::setSuperEncrypted(bool superEncrypted) {
-    mBlob.flags = setFlag(mBlob.flags, superEncrypted, KEYSTORE_FLAG_SUPER_ENCRYPTED);
+void Blob::setSuperEncrypted(__attribute__((unused)) bool superEncrypted) {
+    // Do not enable super encryption yet, as it's clashing with synthetic password flow
+    // TODO: re-enables this once keystore knows about synthetic password keys
+
+    //mBlob.flags = setFlag(mBlob.flags, superEncrypted, KEYSTORE_FLAG_SUPER_ENCRYPTED);
 }
 
 void Blob::setFallback(bool fallback) {
@@ -191,7 +194,7 @@ ResponseCode Blob::readBlob(const char* filename, AES_KEY* aes_key, State state)
     }
 
     ssize_t digestedLength;
-    if (isEncrypted()) {
+    if (isEncrypted() || isSuperEncrypted()) {
         if (encryptedLength % AES_BLOCK_SIZE != 0) {
             return ResponseCode::VALUE_CORRUPTED;
         }
