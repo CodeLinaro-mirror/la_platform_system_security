@@ -95,6 +95,12 @@ class Blob {
     bool isEncrypted() const;
     void setEncrypted(bool encrypted);
 
+    bool isSuperEncrypted() const;
+    void setSuperEncrypted(bool superEncrypted);
+
+    bool isCriticalToDeviceEncryption() const;
+    void setCriticalToDeviceEncryption(bool critical);
+
     bool isFallback() const { return mBlob.flags & KEYSTORE_FLAG_FALLBACK; }
     void setFallback(bool fallback);
 
