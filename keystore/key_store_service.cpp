@@ -40,14 +40,86 @@
 #include <keystore/keystore_hidl_support.h>
 
 namespace keystore {
+
 using namespace android;
 
-const size_t MAX_OPERATIONS = 15;
+namespace {
+
+constexpr size_t kMaxOperations = 15;
+constexpr double kIdRotationPeriod = 30 * 24 * 60 * 60; /* Thirty days, in seconds */
+const char* kTimestampFilePath = "timestamp";
 
 struct BIGNUM_Delete {
     void operator()(BIGNUM* p) const { BN_free(p); }
 };
 typedef UniquePtr<BIGNUM, BIGNUM_Delete> Unique_BIGNUM;
+
+bool containsTag(const hidl_vec<KeyParameter>& params, Tag tag) {
+    return params.end() != std::find_if(params.begin(), params.end(),
+                                        [&](auto& param) { return param.tag == tag; });
+}
+
+bool isAuthenticationBound(const hidl_vec<KeyParameter>& params) {
+    return !containsTag(params, Tag::NO_AUTH_REQUIRED);
+}
+
+std::pair<KeyStoreServiceReturnCode, bool> hadFactoryResetSinceIdRotation() {
+    struct stat sbuf;
+    if (stat(kTimestampFilePath, &sbuf) == 0) {
+        double diff_secs = difftime(time(NULL), sbuf.st_ctime);
+        return {ResponseCode::NO_ERROR, diff_secs < kIdRotationPeriod};
+    }
+
+    if (errno != ENOENT) {
+        ALOGE("Failed to stat \"timestamp\" file, with error %d", errno);
+        return {ResponseCode::SYSTEM_ERROR, false /* don't care */};
+    }
+
+    int fd = creat(kTimestampFilePath, 0600);
+    if (fd < 0) {
+        ALOGE("Couldn't create \"timestamp\" file, with error %d", errno);
+        return {ResponseCode::SYSTEM_ERROR, false /* don't care */};
+    }
+
+    if (close(fd)) {
+        ALOGE("Couldn't close \"timestamp\" file, with error %d", errno);
+        return {ResponseCode::SYSTEM_ERROR, false /* don't care */};
+    }
+
+    return {ResponseCode::NO_ERROR, true};
+}
+
+constexpr size_t KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE = 1024;
+
+KeyStoreServiceReturnCode updateParamsForAttestation(uid_t callingUid, AuthorizationSet* params) {
+    KeyStoreServiceReturnCode responseCode;
+    bool factoryResetSinceIdRotation;
+    std::tie(responseCode, factoryResetSinceIdRotation) = hadFactoryResetSinceIdRotation();
+
+    if (!responseCode.isOk()) return responseCode;
+    if (factoryResetSinceIdRotation) params->push_back(TAG_RESET_SINCE_ID_ROTATION);
+
+    auto asn1_attestation_id_result = security::gather_attestation_application_id(callingUid);
+    if (!asn1_attestation_id_result.isOk()) {
+        ALOGE("failed to gather attestation_id");
+        return ErrorCode::ATTESTATION_APPLICATION_ID_MISSING;
+    }
+    std::vector<uint8_t>& asn1_attestation_id = asn1_attestation_id_result;
+
+    /*
+     * The attestation application ID cannot be longer than
+     * KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE, so we truncate if too long.
+     */
+    if (asn1_attestation_id.size() > KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE) {
+        asn1_attestation_id.resize(KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE);
+    }
+
+    params->push_back(TAG_ATTESTATION_APPLICATION_ID, asn1_attestation_id);
+
+    return ResponseCode::NO_ERROR;
+}
+
+}  // anonymous namespace
 
 void KeyStoreService::binderDied(const wp<IBinder>& who) {
     auto operations = mOperationMap.getOperationsForToken(who.unsafe_get());
@@ -590,6 +662,17 @@ KeyStoreServiceReturnCode KeyStoreService::clear_uid(int64_t targetUid64) {
     for (uint32_t i = 0; i < aliases.size(); i++) {
         String8 name8(aliases[i]);
         String8 filename(mKeyStore->getKeyNameForUidWithDir(name8, targetUid, ::TYPE_ANY));
+
+        if (get_app_id(targetUid) == AID_SYSTEM) {
+            Blob keyBlob;
+            ResponseCode responseCode =
+                mKeyStore->get(filename.string(), &keyBlob, ::TYPE_ANY, get_user_id(targetUid));
+            if (responseCode == ResponseCode::NO_ERROR && keyBlob.isCriticalToDeviceEncryption()) {
+                // Do not clear keys critical to device encryption under system uid.
+                continue;
+            }
+        }
+
         mKeyStore->del(filename.string(), ::TYPE_ANY, get_user_id(targetUid));
 
         // del() will fail silently if no cached characteristics are present for this alias.
@@ -615,6 +698,14 @@ KeyStoreServiceReturnCode KeyStoreService::generateKey(const String16& name,
         checkBinderPermissionAndKeystoreState(P_INSERT, uid, flags & KEYSTORE_FLAG_ENCRYPTED);
     if (!rc.isOk()) {
         return rc;
+    }
+    if ((flags & KEYSTORE_FLAG_CRITICAL_TO_DEVICE_ENCRYPTION) && get_app_id(uid) != AID_SYSTEM) {
+        ALOGE("Non-system uid %d cannot set FLAG_CRITICAL_TO_DEVICE_ENCRYPTION", uid);
+        return ResponseCode::PERMISSION_DENIED;
+    }
+
+    if (containsTag(params, Tag::INCLUDE_UNIQUE_ID)) {
+        if (!checkBinderPermission(P_GEN_UNIQUE_ID)) return ResponseCode::PERMISSION_DENIED;
     }
 
     bool usingFallback = false;
@@ -642,6 +733,10 @@ KeyStoreServiceReturnCode KeyStoreService::generateKey(const String16& name,
 
         Blob keyBlob(&hidlKeyBlob[0], hidlKeyBlob.size(), NULL, 0, ::TYPE_KEYMASTER_10);
         keyBlob.setFallback(usingFallback);
+        keyBlob.setCriticalToDeviceEncryption(flags & KEYSTORE_FLAG_CRITICAL_TO_DEVICE_ENCRYPTION);
+        if (isAuthenticationBound(params) && !keyBlob.isCriticalToDeviceEncryption()) {
+            keyBlob.setSuperEncrypted(true);
+        }
         keyBlob.setEncrypted(flags & KEYSTORE_FLAG_ENCRYPTED);
 
         error = mKeyStore->put(filename.string(), &keyBlob, get_user_id(uid));
@@ -764,6 +859,10 @@ KeyStoreService::importKey(const String16& name, const hidl_vec<KeyParameter>& p
     if (!rc.isOk()) {
         return rc;
     }
+    if ((flags & KEYSTORE_FLAG_CRITICAL_TO_DEVICE_ENCRYPTION) && get_app_id(uid) != AID_SYSTEM) {
+        ALOGE("Non-system uid %d cannot set FLAG_CRITICAL_TO_DEVICE_ENCRYPTION", uid);
+        return ResponseCode::PERMISSION_DENIED;
+    }
 
     bool usingFallback = false;
     auto& dev = mKeyStore->getDevice();
@@ -786,6 +885,10 @@ KeyStoreService::importKey(const String16& name, const hidl_vec<KeyParameter>& p
 
         Blob ksBlob(&keyBlob[0], keyBlob.size(), NULL, 0, ::TYPE_KEYMASTER_10);
         ksBlob.setFallback(usingFallback);
+        ksBlob.setCriticalToDeviceEncryption(flags & KEYSTORE_FLAG_CRITICAL_TO_DEVICE_ENCRYPTION);
+        if (isAuthenticationBound(params) && !ksBlob.isCriticalToDeviceEncryption()) {
+            ksBlob.setSuperEncrypted(true);
+        }
         ksBlob.setEncrypted(flags & KEYSTORE_FLAG_ENCRYPTED);
 
         error = mKeyStore->put(filename.string(), &ksBlob, get_user_id(uid));
@@ -922,6 +1025,9 @@ void KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name, K
     Blob keyBlob;
     String8 name8(name);
     result->resultCode = mKeyStore->getKeyForName(&keyBlob, name8, targetUid, TYPE_KEYMASTER_10);
+    if (result->resultCode == ResponseCode::LOCKED && keyBlob.isSuperEncrypted()) {
+        result->resultCode = ErrorCode::KEY_USER_NOT_AUTHENTICATED;
+    }
     if (!result->resultCode.isOk()) {
         return;
     }
@@ -1004,9 +1110,9 @@ void KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name, K
         return;
     }
 
-    // If there are more than MAX_OPERATIONS, abort the oldest operation that was started as
+    // If there are more than kMaxOperations, abort the oldest operation that was started as
     // pruneable.
-    while (mOperationMap.getOperationCount() >= MAX_OPERATIONS) {
+    while (mOperationMap.getOperationCount() >= kMaxOperations) {
         ALOGD("Reached or exceeded concurrent operations limit");
         if (!pruneOperation()) {
             break;
@@ -1239,22 +1345,20 @@ KeyStoreServiceReturnCode KeyStoreService::addAuthToken(const uint8_t* token, si
     return ResponseCode::NO_ERROR;
 }
 
-constexpr size_t KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE = 1024;
-
 bool isDeviceIdAttestationRequested(const hidl_vec<KeyParameter>& params) {
     for (size_t i = 0; i < params.size(); ++i) {
         switch (params[i].tag) {
-            case Tag::ATTESTATION_ID_BRAND:
-            case Tag::ATTESTATION_ID_DEVICE:
-            case Tag::ATTESTATION_ID_PRODUCT:
-            case Tag::ATTESTATION_ID_SERIAL:
-            case Tag::ATTESTATION_ID_IMEI:
-            case Tag::ATTESTATION_ID_MEID:
-            case Tag::ATTESTATION_ID_MANUFACTURER:
-            case Tag::ATTESTATION_ID_MODEL:
-                return true;
-            default:
-                break;
+        case Tag::ATTESTATION_ID_BRAND:
+        case Tag::ATTESTATION_ID_DEVICE:
+        case Tag::ATTESTATION_ID_IMEI:
+        case Tag::ATTESTATION_ID_MANUFACTURER:
+        case Tag::ATTESTATION_ID_MEID:
+        case Tag::ATTESTATION_ID_MODEL:
+        case Tag::ATTESTATION_ID_PRODUCT:
+        case Tag::ATTESTATION_ID_SERIAL:
+            return true;
+        default:
+            break;
         }
     }
     return false;
@@ -1271,46 +1375,25 @@ KeyStoreServiceReturnCode KeyStoreService::attestKey(const String16& name,
         return ErrorCode::INVALID_ARGUMENT;
     }
 
+    if (isDeviceIdAttestationRequested(params)) {
+        // There is a dedicated attestDeviceIds() method for device ID attestation.
+        return ErrorCode::INVALID_ARGUMENT;
+    }
+
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
 
-    bool attestingDeviceIds = isDeviceIdAttestationRequested(params);
-    if (attestingDeviceIds) {
-        sp<IBinder> binder = defaultServiceManager()->getService(String16("permission"));
-        if (binder == 0) {
-            return ErrorCode::CANNOT_ATTEST_IDS;
-        }
-        if (!interface_cast<IPermissionController>(binder)->checkPermission(
-                String16("android.permission.READ_PRIVILEGED_PHONE_STATE"),
-                IPCThreadState::self()->getCallingPid(), callingUid)) {
-                    return ErrorCode::CANNOT_ATTEST_IDS;
-        }
+    AuthorizationSet mutableParams = params;
+    KeyStoreServiceReturnCode rc = updateParamsForAttestation(callingUid, &mutableParams);
+    if (!rc.isOk()) {
+        return rc;
     }
 
     Blob keyBlob;
     String8 name8(name);
-    KeyStoreServiceReturnCode responseCode =
-        mKeyStore->getKeyForName(&keyBlob, name8, callingUid, TYPE_KEYMASTER_10);
-    if (!responseCode.isOk()) {
-        return responseCode;
+    rc = mKeyStore->getKeyForName(&keyBlob, name8, callingUid, TYPE_KEYMASTER_10);
+    if (!rc.isOk()) {
+        return rc;
     }
-
-    auto asn1_attestation_id_result = security::gather_attestation_application_id(callingUid);
-    if (!asn1_attestation_id_result.isOk()) {
-        ALOGE("failed to gather attestation_id");
-        return ErrorCode::ATTESTATION_APPLICATION_ID_MISSING;
-    }
-    std::vector<uint8_t>& asn1_attestation_id = asn1_attestation_id_result;
-
-    /*
-     * The attestation application ID cannot be longer than
-     * KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE, so we truncate if too long.
-     */
-    if (asn1_attestation_id.size() > KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE)
-        asn1_attestation_id.resize(KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE);
-
-    AuthorizationSet mutableParams = params;
-
-    mutableParams.push_back(TAG_ATTESTATION_APPLICATION_ID, blob2hidlVec(asn1_attestation_id));
 
     KeyStoreServiceReturnCode error;
     auto hidlCb = [&](ErrorCode ret, const hidl_vec<hidl_vec<uint8_t>>& certChain) {
@@ -1323,15 +1406,86 @@ KeyStoreServiceReturnCode KeyStoreService::attestKey(const String16& name,
 
     auto hidlKey = blob2hidlVec(keyBlob);
     auto& dev = mKeyStore->getDevice(keyBlob);
-    KeyStoreServiceReturnCode attestationRc =
-        KS_HANDLE_HIDL_ERROR(dev->attestKey(hidlKey, mutableParams.hidl_data(), hidlCb));
-
-    KeyStoreServiceReturnCode deletionRc;
-    if (attestingDeviceIds) {
-        // When performing device id attestation, treat the key as ephemeral and delete it straight
-        // away.
-        deletionRc = KS_HANDLE_HIDL_ERROR(dev->deleteKey(hidlKey));
+    rc = KS_HANDLE_HIDL_ERROR(dev->attestKey(hidlKey, mutableParams.hidl_data(), hidlCb));
+    if (!rc.isOk()) {
+        return rc;
     }
+    return error;
+}
+
+KeyStoreServiceReturnCode KeyStoreService::attestDeviceIds(const hidl_vec<KeyParameter>& params,
+                                                           hidl_vec<hidl_vec<uint8_t>>* outChain) {
+    if (!outChain) {
+        return ErrorCode::OUTPUT_PARAMETER_NULL;
+    }
+
+    if (!checkAllowedOperationParams(params)) {
+        return ErrorCode::INVALID_ARGUMENT;
+    }
+
+    if (!isDeviceIdAttestationRequested(params)) {
+        // There is an attestKey() method for attesting keys without device ID attestation.
+        return ErrorCode::INVALID_ARGUMENT;
+    }
+
+    uid_t callingUid = IPCThreadState::self()->getCallingUid();
+    sp<IBinder> binder = defaultServiceManager()->getService(String16("permission"));
+    if (binder == 0) {
+        return ErrorCode::CANNOT_ATTEST_IDS;
+    }
+    if (!interface_cast<IPermissionController>(binder)->checkPermission(
+            String16("android.permission.READ_PRIVILEGED_PHONE_STATE"),
+            IPCThreadState::self()->getCallingPid(), callingUid)) {
+        return ErrorCode::CANNOT_ATTEST_IDS;
+    }
+
+    AuthorizationSet mutableParams = params;
+    KeyStoreServiceReturnCode rc = updateParamsForAttestation(callingUid, &mutableParams);
+    if (!rc.isOk()) {
+        return rc;
+    }
+
+    // Generate temporary key.
+    auto& dev = mKeyStore->getDevice();
+    KeyStoreServiceReturnCode error;
+    hidl_vec<uint8_t> hidlKey;
+
+    AuthorizationSet keyCharacteristics;
+    keyCharacteristics.push_back(TAG_PURPOSE, KeyPurpose::VERIFY);
+    keyCharacteristics.push_back(TAG_ALGORITHM, Algorithm::EC);
+    keyCharacteristics.push_back(TAG_DIGEST, Digest::SHA_2_256);
+    keyCharacteristics.push_back(TAG_NO_AUTH_REQUIRED);
+    keyCharacteristics.push_back(TAG_EC_CURVE, EcCurve::P_256);
+    auto generateHidlCb = [&](ErrorCode ret, const hidl_vec<uint8_t>& hidlKeyBlob,
+                              const KeyCharacteristics&) {
+        error = ret;
+        if (!error.isOk()) {
+            return;
+        }
+        hidlKey = hidlKeyBlob;
+    };
+
+    rc = KS_HANDLE_HIDL_ERROR(dev->generateKey(keyCharacteristics.hidl_data(), generateHidlCb));
+    if (!rc.isOk()) {
+        return rc;
+    }
+    if (!error.isOk()) {
+        return error;
+    }
+
+    // Attest key and device IDs.
+    auto attestHidlCb = [&](ErrorCode ret, const hidl_vec<hidl_vec<uint8_t>>& certChain) {
+        error = ret;
+        if (!error.isOk()) {
+            return;
+        }
+        *outChain = certChain;
+    };
+    KeyStoreServiceReturnCode attestationRc =
+            KS_HANDLE_HIDL_ERROR(dev->attestKey(hidlKey, mutableParams.hidl_data(), attestHidlCb));
+
+    // Delete temporary key.
+    KeyStoreServiceReturnCode deletionRc = KS_HANDLE_HIDL_ERROR(dev->deleteKey(hidlKey));
 
     if (!attestationRc.isOk()) {
         return attestationRc;
@@ -1465,9 +1619,9 @@ bool KeyStoreService::isKeystoreUnlocked(State state) {
 bool KeyStoreService::checkAllowedOperationParams(const hidl_vec<KeyParameter>& params) {
     for (size_t i = 0; i < params.size(); ++i) {
         switch (params[i].tag) {
-        case Tag::AUTH_TOKEN:
-        // fall through intended
         case Tag::ATTESTATION_APPLICATION_ID:
+        case Tag::AUTH_TOKEN:
+        case Tag::RESET_SINCE_ID_ROTATION:
             return false;
         default:
             break;
@@ -1725,6 +1879,8 @@ KeyStoreServiceReturnCode KeyStoreService::upgradeKeyBlob(const String16& name, 
                      0 /* infoLength */, ::TYPE_KEYMASTER_10);
         newBlob.setFallback(blob->isFallback());
         newBlob.setEncrypted(blob->isEncrypted());
+        newBlob.setSuperEncrypted(blob->isSuperEncrypted());
+        newBlob.setCriticalToDeviceEncryption(blob->isCriticalToDeviceEncryption());
 
         error = mKeyStore->put(filename.string(), &newBlob, get_user_id(uid));
         if (!error.isOk()) {
@@ -1745,4 +1901,4 @@ KeyStoreServiceReturnCode KeyStoreService::upgradeKeyBlob(const String16& name, 
     return error;
 }
 
-}  // namespace android
+}  // namespace keystore
