@@ -259,7 +259,7 @@ void KeyStore::lock(uid_t userId) {
 ResponseCode KeyStore::get(const char* filename, Blob* keyBlob, const BlobType type, uid_t userId) {
     UserState* userState = getUserState(userId);
     ResponseCode rc =
-        keyBlob->readBlob(filename, userState->getDecryptionKey(), userState->getState());
+        keyBlob->readBlob(filename, userState->getEncryptionKey(), userState->getState());
     if (rc != ResponseCode::NO_ERROR) {
         return rc;
     }
@@ -272,7 +272,7 @@ ResponseCode KeyStore::get(const char* filename, Blob* keyBlob, const BlobType t
          */
         if (upgradeBlob(filename, keyBlob, version, type, userId)) {
             if ((rc = this->put(filename, keyBlob, userId)) != ResponseCode::NO_ERROR ||
-                (rc = keyBlob->readBlob(filename, userState->getDecryptionKey(),
+                (rc = keyBlob->readBlob(filename, userState->getEncryptionKey(),
                                         userState->getState())) != ResponseCode::NO_ERROR) {
                 return rc;
             }
@@ -647,7 +647,7 @@ bool KeyStore::upgradeBlob(const char* filename, Blob* blob, const uint8_t oldVe
 struct BIO_Delete {
     void operator()(BIO* p) const { BIO_free(p); }
 };
-typedef UniquePtr<BIO, BIO_Delete> Unique_BIO;
+typedef std::unique_ptr<BIO, BIO_Delete> Unique_BIO;
 
 ResponseCode KeyStore::importBlobAsKey(Blob* blob, const char* filename, uid_t uid) {
     // We won't even write to the blob directly with this BIO, so const_cast is okay.
@@ -670,7 +670,7 @@ ResponseCode KeyStore::importBlobAsKey(Blob* blob, const char* filename, uid_t u
         return ResponseCode::SYSTEM_ERROR;
     }
 
-    UniquePtr<unsigned char[]> pkcs8key(new unsigned char[len]);
+    std::unique_ptr<unsigned char[]> pkcs8key(new unsigned char[len]);
     uint8_t* tmp = pkcs8key.get();
     if (i2d_PKCS8_PRIV_KEY_INFO(pkcs8.get(), &tmp) != len) {
         ALOGE("Couldn't convert to PKCS#8");
