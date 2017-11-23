@@ -71,7 +71,6 @@ LOCAL_MODULE_TAGS := optional
 LOCAL_INIT_RC := keystore.rc
 LOCAL_C_INCLUES := system/keymaster/
 LOCAL_CLANG := true
-LOCAL_SDCLANG := false
 LOCAL_SANITIZE := integer
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 LOCAL_AIDL_INCLUDES := frameworks/base/core/java/
