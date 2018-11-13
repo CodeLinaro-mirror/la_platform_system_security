@@ -30,6 +30,7 @@
 #include <binder/IPCThreadState.h>
 #include <binder/IPermissionController.h>
 #include <binder/IServiceManager.h>
+#include <cutils/multiuser.h>
 #include <log/log_event_list.h>
 
 #include <private/android_filesystem_config.h>
@@ -862,7 +863,7 @@ KeyStoreService::generateKey(const String16& name, const KeymasterArguments& par
         // Most Java processes don't have access to this tag
         KeyParameter user_id;
         user_id.tag = Tag::USER_ID;
-        user_id.f.integer = mActiveUserId;
+        user_id.f.integer = multiuser_get_user_id(uid);
         keyCharacteristics.push_back(user_id);
     }
 
@@ -995,7 +996,6 @@ KeyStoreService::importKey(const String16& name, const KeymasterArguments& param
                            const ::std::vector<uint8_t>& keyData, int uid, int flags,
                            ::android::security::keymaster::KeyCharacteristics* outCharacteristics,
                            int32_t* aidl_return) {
-
     uid = getEffectiveUid(uid);
     auto logOnScopeExit = android::base::make_scope_guard([&] {
         if (__android_log_security()) {
@@ -1103,7 +1103,7 @@ KeyStoreService::importKey(const String16& name, const KeymasterArguments& param
         // Most Java processes don't have access to this tag
         KeyParameter user_id;
         user_id.tag = Tag::USER_ID;
-        user_id.f.integer = mActiveUserId;
+        user_id.f.integer = multiuser_get_user_id(uid);
         opParams.push_back(user_id);
     }
 
@@ -1374,7 +1374,14 @@ Status KeyStoreService::begin(const sp<IBinder>& appToken, const String16& name,
                                                             }));
 
         if (!rc.isOk()) result->resultCode = rc;
-        if (!result->resultCode.isOk()) return Status::ok();
+        if (!result->resultCode.isOk()) {
+            LOG(ERROR) << "Failed to verify authorization " << rc << " from begin()";
+            rc = KS_HANDLE_HIDL_ERROR(dev->abort(result->handle));
+            if (!rc.isOk()) {
+                LOG(ERROR) << "Failed to abort operation " << rc << " from begin()";
+            }
+            return Status::ok();
+        }
     }
 
     // Note: The operation map takes possession of the contents of "characteristics".
@@ -1465,7 +1472,12 @@ Status KeyStoreService::update(const sp<IBinder>& token, const KeymasterArgument
 
     // just a reminder: on success result->resultCode was set in the callback. So we only overwrite
     // it if there was a communication error indicated by the ErrorCode.
-    if (!rc.isOk()) result->resultCode = rc;
+    if (!rc.isOk()) {
+        result->resultCode = rc;
+        // removeOperation() will free the memory 'op' used, so the order is important
+        mAuthTokenTable.MarkCompleted(op.handle);
+        mOperationMap.removeOperation(token, /* wasOpSuccessful */ false);
+    }
 
     return Status::ok();
 }
@@ -2303,9 +2315,6 @@ KeyStoreServiceReturnCode KeyStoreService::upgradeKeyBlob(const String16& name, 
 Status KeyStoreService::onKeyguardVisibilityChanged(bool isShowing, int32_t userId,
                                                     int32_t* aidl_return) {
     enforcement_policy.set_device_locked(isShowing, userId);
-    if (!isShowing) {
-        mActiveUserId = userId;
-    }
     *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
 
     return Status::ok();
