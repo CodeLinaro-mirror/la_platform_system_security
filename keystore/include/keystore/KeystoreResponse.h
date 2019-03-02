@@ -34,8 +34,9 @@ struct KeystoreResponse : public ::android::Parcelable {
         : response_code_(response_code), error_msg_(std::make_unique<String16>(error_msg)) {}
     explicit KeystoreResponse(const int response_code)
         : response_code_(response_code), error_msg_() {}
+    // NOLINTNEXTLINE(google-explicit-constructor)
     KeystoreResponse(const ::keystore::KeyStoreServiceReturnCode& rc)
-        : response_code_(int32_t(rc)), error_msg_() {}
+        : response_code_(rc.getErrorCode()), error_msg_() {}
     KeystoreResponse(const KeystoreResponse& other)
         : response_code_(other.response_code_), error_msg_() {
         if (other.error_msg_) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,21 +14,29 @@
  * limitations under the License.
  */
 
-#ifndef KEYSTORE_ENTROPY_H_
-#define KEYSTORE_ENTROPY_H_
+#include <gtest/gtest.h>
 
-#include <stdint.h>
+#include <string>
+#include <utils/String16.h>
 
-class Entropy {
-  public:
-    Entropy() : mRandom(-1) {}
-    ~Entropy();
+#include "../blob.h"
 
-    bool open();
-    bool generate_random_data(uint8_t* data, size_t size) const;
+namespace keystore {
 
-  private:
-    int mRandom;
-};
+namespace test {
 
-#endif  // KEYSTORE_ENTROPY_H_
+namespace {
+
+constexpr const char* kNameToEncode = "some key name !\\ %#|\"";
+
+}  // namespace
+
+TEST(BlobTest, nameEncodingAndDecodingTest) {
+    std::string toEncode(kNameToEncode);
+    std::string decoded(decodeKeyName(encodeKeyName(toEncode)));
+
+    ASSERT_EQ(toEncode, decoded);
+}
+
+}  // namespace test
+}  // namespace keystore
