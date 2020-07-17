@@ -888,7 +888,7 @@ Status KeyStoreService::begin(const sp<IKeystoreOperationResultCallback>& cb,
                [this, cb, dev](OperationResult result_) {
                    if (result_.resultCode.isOk() ||
                        result_.resultCode == ResponseCode::OP_AUTH_NEEDED) {
-                       addOperationDevice(result_.token, dev);
+                       mKeyStore->addOperationDevice(result_.token, dev);
                    }
                    cb->onFinished(result_);
                });
@@ -905,14 +905,14 @@ Status KeyStoreService::update(const ::android::sp<IKeystoreOperationResultCallb
         return AIDL_RETURN(ErrorCode::INVALID_ARGUMENT);
     }
 
-    auto dev = getOperationDevice(token);
+    auto dev = mKeyStore->getOperationDevice(token);
     if (!dev) {
         return AIDL_RETURN(ErrorCode::INVALID_OPERATION_HANDLE);
     }
 
     dev->update(token, params.getParameters(), input, [this, cb, token](OperationResult result_) {
         if (!result_.resultCode.isOk()) {
-            removeOperationDevice(token);
+            mKeyStore->removeOperationDevice(token);
         }
         cb->onFinished(result_);
     });
@@ -930,16 +930,14 @@ Status KeyStoreService::finish(const ::android::sp<IKeystoreOperationResultCallb
         return AIDL_RETURN(ErrorCode::INVALID_ARGUMENT);
     }
 
-    auto dev = getOperationDevice(token);
+    auto dev = mKeyStore->getOperationDevice(token);
     if (!dev) {
         return AIDL_RETURN(ErrorCode::INVALID_OPERATION_HANDLE);
     }
 
     dev->finish(token, params.getParameters(), {}, signature, entropy,
                 [this, cb, token](OperationResult result_) {
-                    if (!result_.resultCode.isOk()) {
-                        removeOperationDevice(token);
-                    }
+                    mKeyStore->removeOperationDevice(token);
                     cb->onFinished(result_);
                 });
 
@@ -950,12 +948,15 @@ Status KeyStoreService::abort(const ::android::sp<IKeystoreResponseCallback>& cb
                               const ::android::sp<::android::IBinder>& token,
                               int32_t* _aidl_return) {
     KEYSTORE_SERVICE_LOCK;
-    auto dev = getOperationDevice(token);
+    auto dev = mKeyStore->getOperationDevice(token);
     if (!dev) {
         return AIDL_RETURN(ErrorCode::INVALID_OPERATION_HANDLE);
     }
 
-    dev->abort(token, [cb](KeyStoreServiceReturnCode rc) { cb->onFinished(rc); });
+    dev->abort(token, [this, cb, token](KeyStoreServiceReturnCode rc) {
+        mKeyStore->removeOperationDevice(token);
+        cb->onFinished(rc);
+    });
 
     return AIDL_RETURN(ResponseCode::NO_ERROR);
 }
@@ -1358,12 +1359,23 @@ bool KeyStoreService::checkAllowedOperationParams(const hidl_vec<KeyParameter>& 
 }
 
 Status KeyStoreService::onKeyguardVisibilityChanged(bool isShowing, int32_t userId,
-                                                    int32_t* aidl_return) {
+                                                    int32_t* _aidl_return) {
     KEYSTORE_SERVICE_LOCK;
+    if (isShowing) {
+        if (!checkBinderPermission(P_LOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == true but "
+                            "without LOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
+    } else {
+        if (!checkBinderPermission(P_UNLOCK, UID_SELF)) {
+            LOG(WARNING) << "onKeyguardVisibilityChanged called with isShowing == false but "
+                            "without UNLOCK permission";
+            return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
+        }
+    }
     mKeyStore->getEnforcementPolicy().set_device_locked(isShowing, userId);
-    *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
-
-    return Status::ok();
+    return AIDL_RETURN(ResponseCode::NO_ERROR);
 }
 
 }  // namespace keystore
