@@ -170,6 +170,7 @@ impl AsyncTask {
     {
         let (ref condvar, ref state) = *self.state;
         let mut state = state.lock().unwrap();
+
         if hi_prio {
             state.hi_prio_req.push_back(Box::new(f));
         } else {
