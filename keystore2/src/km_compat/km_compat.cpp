@@ -59,6 +59,8 @@ namespace KMV1 = ::aidl::android::hardware::security::keymint;
 using namespace std::chrono_literals;
 using std::chrono::duration_cast;
 
+static const KMV1::Tag KM_TAG_FBE_ICE = static_cast<KMV1::Tag>((7 << 28) | 16201);
+
 // Utility functions
 
 // Returns true if this parameter may be passed to attestKey.
@@ -304,33 +306,36 @@ convertKeyParametersFromLegacy(const std::vector<V4_0_KeyParameter>& legacyKps) 
 static std::vector<KeyCharacteristics>
 processLegacyCharacteristics(KeyMintSecurityLevel securityLevel,
                              const std::vector<KeyParameter>& genParams,
-                             const V4_0_KeyCharacteristics& legacyKc, bool hwEnforcedOnly = false) {
+                             const V4_0_KeyCharacteristics& legacyKc, bool kmEnforcedOnly = false) {
 
-    KeyCharacteristics hwEnforced{securityLevel,
-                                  convertKeyParametersFromLegacy(legacyKc.hardwareEnforced)};
+    KeyCharacteristics kmEnforced{securityLevel, convertKeyParametersFromLegacy(
+                                                     securityLevel == KeyMintSecurityLevel::SOFTWARE
+                                                         ? legacyKc.softwareEnforced
+                                                         : legacyKc.hardwareEnforced)};
 
-    if (hwEnforcedOnly) {
-        return {hwEnforced};
+    if (securityLevel == KeyMintSecurityLevel::SOFTWARE && legacyKc.hardwareEnforced.size() > 0) {
+        LOG(WARNING) << "Unexpected hardware enforced parameters.";
     }
 
-    KeyCharacteristics keystoreEnforced{KeyMintSecurityLevel::KEYSTORE,
-                                        convertKeyParametersFromLegacy(legacyKc.softwareEnforced)};
+    if (kmEnforcedOnly) {
+        return {kmEnforced};
+    }
+
+    KeyCharacteristics keystoreEnforced{KeyMintSecurityLevel::KEYSTORE, {}};
+
+    if (securityLevel != KeyMintSecurityLevel::SOFTWARE) {
+        // Don't include these tags on software backends, else they'd end up duplicated
+        // across both the keystore-enforced and software keymaster-enforced tags.
+        keystoreEnforced.authorizations = convertKeyParametersFromLegacy(legacyKc.softwareEnforced);
+    }
 
     // Add all parameters that we know can be enforced by keystore but not by the legacy backend.
     auto unsupported_requested = extractNewAndKeystoreEnforceableParams(genParams);
-    std::copy(unsupported_requested.begin(), unsupported_requested.end(),
-              std::back_insert_iterator(keystoreEnforced.authorizations));
+    keystoreEnforced.authorizations.insert(keystoreEnforced.authorizations.end(),
+                                           std::begin(unsupported_requested),
+                                           std::end(unsupported_requested));
 
-    if (securityLevel == KeyMintSecurityLevel::SOFTWARE) {
-        // If the security level of the backend is `software` we expect the hardware enforced list
-        // to be empty. Log a warning otherwise.
-        if (legacyKc.hardwareEnforced.size() != 0) {
-            LOG(WARNING) << "Unexpected hardware enforced parameters.";
-        }
-        return {keystoreEnforced};
-    }
-
-    return {hwEnforced, keystoreEnforced};
+    return {kmEnforced, keystoreEnforced};
 }
 
 static V4_0_KeyFormat convertKeyFormatToLegacy(const KeyFormat& kf) {
@@ -457,6 +462,18 @@ ScopedAStatus KeyMintDevice::generateKey(const std::vector<KeyParameter>& inKeyP
 
     auto legacyKeyGenParams = convertKeyParametersToLegacy(extractGenerationParams(inKeyParams));
     KMV1::ErrorCode errorCode;
+
+    for (const auto& keyParam : inKeyParams) {
+        if((int32_t)keyParam.tag==(int32_t)KM_TAG_FBE_ICE) {
+            android::hardware::keymaster::V4_0::KeyParameter param1;
+            param1.tag = static_cast<::android::hardware::keymaster::V4_0::Tag>
+			(android::hardware::keymaster::V4_0::KM_TAG_FBE_ICE);
+            param1.f.boolValue = true;
+            legacyKeyGenParams.push_back(param1);
+            break;
+        }
+    }
+
     auto result = mDevice->generateKey(
         legacyKeyGenParams, [&](V4_0_ErrorCode error, const hidl_vec<uint8_t>& keyBlob,
                                 const V4_0_KeyCharacteristics& keyCharacteristics) {
@@ -722,7 +739,7 @@ ScopedAStatus KeyMintDevice::getKeyCharacteristics(
                 km_error = convert(errorCode);
                 *keyCharacteristics =
                     processLegacyCharacteristics(securityLevel_, {} /* getParams */,
-                                                 v40KeyCharacteristics, true /* hwEnforcedOnly */);
+                                                 v40KeyCharacteristics, true /* kmEnforcedOnly */);
             });
 
         if (!ret.isOk()) {
@@ -1395,8 +1412,7 @@ KeystoreCompatService::getKeyMintDevice(KeyMintSecurityLevel in_securityLevel,
         if (!device) {
             return ScopedAStatus::fromStatus(STATUS_NAME_NOT_FOUND);
         }
-        bool inserted = false;
-        std::tie(i, inserted) = mDeviceCache.insert({in_securityLevel, std::move(device)});
+        i = mDeviceCache.insert(i, {in_securityLevel, std::move(device)});
     }
     *_aidl_return = i->second;
     return ScopedAStatus::ok();
@@ -1404,14 +1420,15 @@ KeystoreCompatService::getKeyMintDevice(KeyMintSecurityLevel in_securityLevel,
 
 ScopedAStatus KeystoreCompatService::getSharedSecret(KeyMintSecurityLevel in_securityLevel,
                                                      std::shared_ptr<ISharedSecret>* _aidl_return) {
-    if (!mSharedSecret) {
+    auto i = mSharedSecretCache.find(in_securityLevel);
+    if (i == mSharedSecretCache.end()) {
         auto secret = SharedSecret::createSharedSecret(in_securityLevel);
         if (!secret) {
             return ScopedAStatus::fromStatus(STATUS_NAME_NOT_FOUND);
         }
-        mSharedSecret = std::move(secret);
+        i = mSharedSecretCache.insert(i, {in_securityLevel, std::move(secret)});
     }
-    *_aidl_return = mSharedSecret;
+    *_aidl_return = i->second;
     return ScopedAStatus::ok();
 }
 
